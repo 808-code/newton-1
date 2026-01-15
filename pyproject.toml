@@ -25,7 +25,12 @@ classifiers = [
 description = "A GPU-accelerated physics engine for robotics simulation"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["warp-lang>=1.11.0.dev20251205"]
+dependencies = [
+	"warp-lang>=1.11.0.dev20251205",
+	"matplotlib>=3.10.7",
+	"noise>=1.2.2",
+    # "movement_primitives",
+]
 
 [project.optional-dependencies]
 # Core simulation dependencies
