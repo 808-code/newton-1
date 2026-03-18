@@ -479,13 +479,19 @@ class Example:
         # ========== F-t 曲线绘制设置 ==========
         self.force_history = []
         self.time_history = []
-        plt.ion()  # 开启交互模式
-        self.fig, self.ax = plt.subplots()
-        self.line, = self.ax.plot(self.time_history, self.force_history)
-        self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("Force (N)")
-        self.ax.set_title("Interaction Force vs. Time")
-        self.ax.grid(True)
+        self.enable_plot = bool(getattr(options, "enable_plot", True))
+        if self.enable_plot:
+            plt.ion()  # 开启交互模式
+            self.fig, self.ax = plt.subplots()
+            self.line, = self.ax.plot(self.time_history, self.force_history)
+            self.ax.set_xlabel("Time (s)")
+            self.ax.set_ylabel("Force (N)")
+            self.ax.set_title("Interaction Force vs. Time")
+            self.ax.grid(True)
+        else:
+            self.fig = None
+            self.ax = None
+            self.line = None
         self.capture()
 
     def capture(self):
@@ -696,13 +702,14 @@ class Example:
             # 使用 \r 和 end="" 实现单行刷新
             print(f"\rInteraction Force: {current_force:8.2f} N", end="")
 
-            # 更新曲线数据
-            self.line.set_xdata(self.time_history)
-            self.line.set_ydata(self.force_history)
-            self.ax.relim()
-            self.ax.autoscale_view()
-            self.fig.canvas.draw()
-            self.fig.canvas.flush_events()
+            if self.enable_plot and self.line is not None and self.ax is not None and self.fig is not None:
+                # 更新曲线数据
+                self.line.set_xdata(self.time_history)
+                self.line.set_ydata(self.force_history)
+                self.ax.relim()
+                self.ax.autoscale_view()
+                self.fig.canvas.draw()
+                self.fig.canvas.flush_events()
 
     def render_ui(self, imgui):
         """渲染UI界面"""
@@ -733,13 +740,13 @@ class Example:
         # - dmp_press_ratio: 下压阶段占比(0~1)，剩余阶段保持 goal
         # - dmp_press_hip / dmp_press_knee: 两个关节的“下压”幅度(rad)
         # - dmp_exp_beta: 指数缓入强度（越大越快接近 goal）
-        exec_time = float(getattr(options, "dmp_execution_time", 1.0))
+        exec_time = float(getattr(options, "dmp_execution_time", 1.5))
         dt = float(getattr(options, "dmp_dt", 0.01))
         n = int(getattr(options, "dmp_n_steps", 120))
         n_w = int(getattr(options, "dmp_n_weights", 20))
-        press_ratio = float(getattr(options, "dmp_press_ratio", 0.8))
+        press_ratio = float(getattr(options, "dmp_press_ratio", 0.9))
         press_ratio = float(np.clip(press_ratio, 0.05, 1.0))
-        beta = float(getattr(options, "dmp_exp_beta", 4.3))
+        beta = float(getattr(options, "dmp_exp_beta", 2.0))
 
         hip0, knee0 = float(start_y[0]), float(start_y[1])
         start = np.array([hip0, knee0], dtype=np.float64)

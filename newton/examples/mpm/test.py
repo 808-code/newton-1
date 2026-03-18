@@ -197,7 +197,7 @@ class Example:
 
         # 构建刚体沙子的耦合系统
         drop_z = 2.0
-        mass = 20.0 
+        mass = 10.0 
         
         # 创建三个物块，位于不同位置
         self.body_block1 = builder.add_body(xform=wp.transform(p=wp.vec3(-0.5, 0.0, drop_z), q=wp.quat_identity()))
@@ -217,7 +217,9 @@ class Example:
         # ========== 沙子模型构建 ==========
         mpm_builder = newton.ModelBuilder()
         # 沙子相关：在指定区域生成 MPM 粒子
-        sand_particles, snow_particles, mud_particles, block_particles = Example.emit_particles(mpm_builder, options)
+        sand_particles, snow_particles, mud_particles, block_particles, particle_weights = Example.emit_particles(
+            mpm_builder, options
+        )
 
         # ========== 物理模型最终化 ==========
         self.model = builder.finalize()
@@ -247,26 +249,49 @@ class Example:
         # 沙子相关：创建 MPM 模型（将 Newton 模型适配为 MPM 格式）
         mpm_model = SolverImplicitMPM.Model(self.mpm_model, mpm_options)
 
-        # --- 雪的属性 (类雪材料) ---
-        mpm_model.material_parameters.yield_pressure[snow_particles].fill_(2.0e4)  # 屈服压力 (较低，易于压缩)
-        mpm_model.material_parameters.yield_stress[snow_particles].fill_(1.0e3)  # 屈服应力 (较低，易于剪切变形)
-        mpm_model.material_parameters.tensile_yield_ratio[snow_particles].fill_(0.05)  # 拉伸屈服比 (抗拉伸能力弱)
-        mpm_model.material_parameters.friction[snow_particles].fill_(0.1)  # 内摩擦角 (较低)
-        mpm_model.material_parameters.hardening[snow_particles].fill_(10.0)  # 硬化系数 (压缩后会变硬)
+        # ========== 连续混合材料参数（替代“阈值分材料”） ==========
+        # 这里的核心思路：
+        # - `emit_particles()` 会为每个粒子生成连续权重 weights=[sand,snow,mud,block]
+        # - 物性不再“按类别硬切换”，而是对每个粒子按权重连续插值（材料边界自然渐变）
+        # - 这种做法能避免分位数/硬阈值造成的“刻意分区”，也更利于做“混杂地形”的过渡带
+        #
+        # 参数混合的小经验：
+        # - 摩擦/硬化等通常在线性域混合即可（同量纲、变化不跨数量级）
+        # - 屈服压力等跨数量级很大的参数，建议在 log 域混合，避免被最大值“淹没”
+        #
+        # 注意：MaterialParameters 是 Warp struct，字段是 wp.array，不能用 `[:] =` 切片赋值，需用 `assign()` 写回。
+        mp = mpm_model.material_parameters
+        w = particle_weights.astype(np.float64, copy=False)
+        w_sand, w_snow, w_mud, w_blk = w[:, 0], w[:, 1], w[:, 2], w[:, 3]
 
-        # --- 泥浆的属性 (类流体材料) ---
-        mpm_model.material_parameters.yield_pressure[mud_particles].fill_(1.0e10)  # 屈服压力 (非常高，几乎不可压缩)
-        mpm_model.material_parameters.yield_stress[mud_particles].fill_(3.0e2)  # 屈服应力 (非常低，易于流动)
-        mpm_model.material_parameters.tensile_yield_ratio[mud_particles].fill_(1.0)  # 拉伸屈服比 (具有一定的抗拉伸能力)
-        mpm_model.material_parameters.hardening[mud_particles].fill_(2.0)  # 硬化系数 (较低)
-        mpm_model.material_parameters.friction[mud_particles].fill_(0.0)  # 内摩擦角 (为0，表现更像流体)
+        def _blend_lin(a: float, b: float, c: float, d: float) -> np.ndarray:
+            # 线性混合：适合摩擦、硬化等“同量纲、变化范围不跨数量级”的参数
+            return w_sand * a + w_snow * b + w_mud * c + w_blk * d
 
-        # --- 石块的属性 (固体材料) ---
-        mpm_model.material_parameters.yield_pressure[block_particles].fill_(1.0e8)  # 屈服压力 (较高，难以压缩)
-        mpm_model.material_parameters.yield_stress[block_particles].fill_(1.0e7)  # 屈服应力 (非常高，抵抗剪切变形能力强)
-        mpm_model.material_parameters.tensile_yield_ratio[block_particles].fill_(0.8)  # 拉伸屈服比 (抗拉伸能力强)
-        mpm_model.material_parameters.friction[block_particles].fill_(0.6)  # 内摩擦角 (高，颗粒间滑动困难)
-        mpm_model.material_parameters.hardening[block_particles].fill_(20.0)  # 硬化系数 (高，压缩后会变得更硬)
+        def _blend_log10(a: float, b: float, c: float, d: float) -> np.ndarray:
+            # 对数域混合：适合屈服压力这类跨多个数量级的参数。
+            # 直接线性混合会被大值“淹没”，用 log10 先混合再还原更合理。
+            eps = 1.0e-30
+            la = float(np.log10(max(a, eps)))
+            lb = float(np.log10(max(b, eps)))
+            lc = float(np.log10(max(c, eps)))
+            ld = float(np.log10(max(d, eps)))
+            return np.power(10.0, _blend_lin(la, lb, lc, ld))
+
+        yield_pressure = _blend_log10(1.0e5, 2.0e4, 1.0e10, 1.0e8)
+        yield_stress = _blend_lin(0.0, 1.0e3, 3.0e2, 1.0e7)
+        tensile_yield_ratio = _blend_lin(0.0, 0.05, 1.0, 0.8)
+        hardening = _blend_lin(0.0, 10.0, 2.0, 20.0)
+        # 摩擦系数物理上通常在 [0,1] 内，混合后做一次截断更稳妥。
+        friction = np.clip(_blend_lin(0.48, 0.10, 0.00, 0.60), 0.0, 1.0)
+
+        wp_device = self.mpm_model.device
+        # 重要：mp.* 是 wp.array，必须用 assign 写回（并且 device 要与模型一致）。
+        mp.yield_pressure.assign(wp.array(yield_pressure, dtype=float, device=wp_device))
+        mp.yield_stress.assign(wp.array(yield_stress, dtype=float, device=wp_device))
+        mp.tensile_yield_ratio.assign(wp.array(tensile_yield_ratio, dtype=float, device=wp_device))
+        mp.hardening.assign(wp.array(hardening, dtype=float, device=wp_device))
+        mp.friction.assign(wp.array(friction, dtype=float, device=wp_device))
 
         # 通知MPM模型，粒子材质参数已发生变化
         mpm_model.notify_particle_material_changed()
@@ -312,13 +337,19 @@ class Example:
         # 沙子施加到刚体上的每个刚体的力和扭矩
         self.body_mpm_forces = wp.zeros_like(self.state_0.body_f)
 
-        self.particle_colors = wp.full(
-            self.mpm_model.particle_count, value=wp.vec3(0.7, 0.6, 0.4), dtype=wp.vec3, device=self.mpm_model.device
+        # 颜色也做连续混合（更直观看到“渐变/混杂”）
+        # 说明：这里的颜色仅用于可视化，真正的物性由上面的 material_parameters 控制。
+        cols = np.array(
+            [
+                [0.7, 0.6, 0.4],   # sand
+                [0.75, 0.75, 0.8], # snow
+                [0.4, 0.25, 0.25], # mud
+                [0.5, 0.5, 0.5],   # block
+            ],
+            dtype=np.float32,
         )
-        self.particle_colors[sand_particles].fill_(wp.vec3(0.7, 0.6, 0.4))
-        self.particle_colors[snow_particles].fill_(wp.vec3(0.75, 0.75, 0.8))
-        self.particle_colors[mud_particles].fill_(wp.vec3(0.4, 0.25, 0.25))
-        self.particle_colors[block_particles].fill_(wp.vec3(0.5, 0.5, 0.5))
+        colors_np = (particle_weights.astype(np.float32) @ cols).astype(np.float32)
+        self.particle_colors = wp.array(colors_np, dtype=wp.vec3, device=self.mpm_model.device)
 
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True  # 显示沙子粒子
@@ -516,74 +547,211 @@ class Example:
 
     @staticmethod
     def emit_particles(builder: newton.ModelBuilder, args):
-        """根据噪声函数在指定区域生成三种不同类型的粒子：沙、雪、泥"""
-        # 1. test 原始方法：生成所有粒子
-        all_ids = Example._spawn_particles(builder, args,
-                                           particle_lo=np.array([-2.0, -2.0, 0.0]),
-                                           particle_hi=np.array([ 2.0,  2.0, 0.25]),
-                                           density=1000,   # 先随便设一个基础密度，稍后会被替换
-                                           flags=newton.ParticleFlags.ACTIVE)
+        """根据 `perlin_noise.md` 的建议生成“混杂地形”。
 
-        # 2. 使用噪声将粒子分类
-        sand_ids, snow_ids, mud_ids, block_ids = Example._classify_by_noise(builder, all_ids)
+        - 多尺度 Perlin（low/mid/high）叠加，得到连续的混合信号
+        - 不再用分位数/硬阈值“分材料”，而是用连续权重混合物理属性
+        - 可选：用高频噪声对粒子初始位置做小扰动，打破规则网格
 
-        # 3. 为三种粒子分配不同密度（来自 mpm_block）
-        Example._assign_density(builder, sand_ids, 2500)  # sand
-        Example._assign_density(builder, snow_ids,  300)  # snow
-        Example._assign_density(builder, mud_ids,  1000)  # mud
-        Example._assign_density(builder, block_ids, 2700)  # block
+        Returns:
+            (sand_ids, snow_ids, mud_ids, block_ids, weights):
+                - *_ids: 为可视化/调试提供的“主导材料”粒子集合（argmax 权重）
+                - weights: (N,4) float32，按粒子 id 对齐的连续权重 [sand, snow, mud, block]
 
-        # 4. 返回粒子 ID
-        return np.array(sand_ids), np.array(snow_ids), np.array(mud_ids), np.array(block_ids)
+        使用说明（命令行）：
+        - 更“精细/颗粒感”：提高 `--noise-frequency` 或 `--noise-octaves`
+        - 更“大块分区/宏观变化”：降低 `--noise-frequency` 或调小 `--noise-low-frequency-mult`
+        - 改一张“地形图样”（可复现）：修改 `--noise-seed`
+        - 石块稀疏度：调 `--noise-block-threshold`（越大越少，建议 0.8~0.95）
+        - 打破网格条纹：调 `--noise-position-jitter`（单位 voxel-size，建议 0.0~0.5）
 
-    #   分类粒子 → 沙、雪、泥（基于噪声并确保三类都存在）
-    @staticmethod
-    def _classify_by_noise(builder, ids):
+        性能提示：当前实现是在 Python for-loop 中对每个粒子采样多次 Perlin（low/mid/high + jitter），
+        `--noise-octaves`、粒子数、以及 high 频采样都会显著影响运行时间。
+        """
 
-        freq = 1.2
-        octaves = 4
+        def _clamp01(x: float) -> float:
+            return float(np.clip(x, 0.0, 1.0))
 
-        noise_vals = []
+        def _smoothstep(edge0: float, edge1: float, x: float) -> float:
+            # 平滑阶跃：让“阈值”变成连续过渡（边界不生硬）。
+            # 这里用 3t^2-2t^3 的经典 smoothstep。
+            if edge0 == edge1:
+                return 0.0
+            t = _clamp01((x - edge0) / (edge1 - edge0))
+            return t * t * (3.0 - 2.0 * t)
 
-        # 1. 计算噪声值
-        for pid in ids:
-            q = builder.particle_q[pid]
-            n = noise.pnoise3(q[0]*freq, q[1]*freq, q[2]*freq, octaves=octaves)
-            n = (n + 1) * 0.5
-            noise_vals.append(n)
+        def _tri(x: float, center: float, width: float) -> float:
+            # 三角形权重（1D membership）：
+            # - x 接近 center 时权重最大
+            # - 距离超过 width 后降到 0
+            # 用于把“中频噪声 n_mid”映射为 sand/snow/mud 的连续比例。
+            if width <= 0.0:
+                return 0.0
+            return max(0.0, 1.0 - abs(x - center) / width)
 
-        noise_vals = np.array(noise_vals)
+        def _noise01(p, freq: float, base: int) -> float:
+            # ========== 3D Perlin 噪声采样 ==========
+            # - 输入是世界坐标 p（乘以频率 freq），不同 freq 对应不同“尺度”
+            # - pnoise3 返回 [-1, 1]，这里映射到 [0, 1]
+            # - octaves/persistence/lacunarity 形成类 fBm 叠加：octaves 越大越“精细”，但越慢
+            # - base=seed：用于可复现地改变噪声图样（同一参数每次运行一致）
+            n = noise.pnoise3(
+                float(p[0]) * freq,
+                float(p[1]) * freq,
+                float(p[2]) * freq,
+                octaves=int(getattr(args, "noise_octaves", 4)),
+                persistence=float(getattr(args, "noise_persistence", 0.5)),
+                lacunarity=float(getattr(args, "noise_lacunarity", 2.0)),
+                base=int(base),
+            )
+            return 0.5 * (float(n) + 1.0)
 
-        # 2. 三等分阈值（避免某一类为 0）
-        t1 = np.quantile(noise_vals, 0.25)
-        t2 = np.quantile(noise_vals, 0.5)
-        t3 = np.quantile(noise_vals, 0.75)
+        # 1) 生成所有粒子
+        # 注意：这里先按一个“占位密度”生成粒子；后面会按每粒子权重混合密度，覆盖写回 particle_mass。
+        all_ids = Example._spawn_particles(
+            builder,
+            args,
+            particle_lo=np.array([-2.0, -2.0, 0.0]),
+            particle_hi=np.array([2.0, 2.0, 0.25]),
+            density=1000,  # 初始占位，后面会按混合密度覆盖到 particle_mass
+            flags=newton.ParticleFlags.ACTIVE,
+        )
 
-        sand = []
-        snow = []
-        mud = []
-        block = []
+        # ========== 2) 多尺度 Perlin：low/mid/high ==========
+        # 经验用法：
+        # - low：大尺度区域（决定“泥区/干区”等宏观分布；也可用来调“压实度”）
+        # - mid：主导材料混合（沙/雪/泥的主要变化尺度）
+        # - high：微细节（边界破碎、颗粒感），通常权重更小，避免“噪声满屏”
+        #
+        # 这里将三层噪声按权重线性叠加得到 terrain：
+        #   terrain = w_low*n_low + w_mid*n_mid + w_high*n_high
+        # 其中 n_* 都在 [0,1]，方便后续用 smoothstep/tri 等连续函数映射到材料权重。
+        base_freq = float(getattr(args, "noise_frequency", 0.0))
+        low_mult = float(getattr(args, "noise_low_frequency_mult", 0.0))
+        high_mult = float(getattr(args, "noise_high_frequency_mult", 0.0))
+        w_low, w_mid, w_high = 0.6, 0.3, 0.1
+        base_seed = int(getattr(args, "noise_seed", 0))
+        block_threshold = float(getattr(args, "noise_block_threshold", 0.0))
 
-        # 3. 分类
-        for pid, n in zip(ids, noise_vals):
-            if n <= t1:
-                sand.append(pid)
-            elif n <= t2:
-                snow.append(pid)
-            elif n <= t3:
-                mud.append(pid)
-            else:
-                block.append(pid)
+        # ========== 可选：粒子位置扰动（打破规则网格） ==========
+        # - 单位：voxel_size（即 dx）
+        # - 建议范围：0.0~0.5（过大可能引入初始穿插/局部过密，导致数值不稳）
+        pos_jitter = float(getattr(args, "noise_position_jitter", 0.0))
+        voxel_size = float(getattr(args, "voxel_size", 0.05))
 
-        return sand, snow, mud, block
+        particle_count = len(builder.particle_q)
+        weights = np.zeros((particle_count, 4), dtype=np.float32)
 
-    #   为一类粒子设置密度：根据体积反推出 mass
+        # 参考值（与你当前代码一致）
+        rho_sand, rho_snow, rho_mud, rho_block = 2500.0, 300.0, 1000.0, 2700.0
+
+        for pid in all_ids:
+            p = builder.particle_q[pid]
+
+            n_low = _noise01(p, base_freq * low_mult, base_seed + 11)
+            n_mid = _noise01(p, base_freq * 1.0, base_seed + 23)
+            n_high = _noise01(p, base_freq * high_mult, base_seed + 37)
+
+            # terrain 是一个“连续混合信号”，用于辅助生成 block 等稀疏结构
+            terrain = w_low * n_low + w_mid * n_mid + w_high * n_high
+
+            # “湿/黏”区域：用低频决定大范围泥区（边界会自然模糊）
+            mudness = _smoothstep(0.55, 0.90, n_low)
+
+            # 材料比例：用中频做连续混合，不再硬分类
+            # - 这里的三个中心值 (0.2/0.5/0.8) 是经验选取：把 [0,1] 分成三段但保持连续
+            # - mud 额外受 mudness 抬高，形成“大片泥区 + 局部变化”
+            w_sand = _tri(n_mid, 0.20, 0.25)
+            w_mud = max(_tri(n_mid, 0.50, 0.25), mudness)
+            w_snow = _tri(n_mid, 0.80, 0.25) * (1.0 - 0.7 * mudness)
+
+            # 岩石/石块：让它稀疏出现（可通过阈值调稀疏程度）
+            # - threshold 越大：越“难触发”，block 越少
+            # - 使用 smoothstep：从“开始出现”到“完全 block”有渐变，而不是硬切
+            w_blk = _smoothstep(block_threshold, 1.0, terrain)
+
+            # 给高频一点点影响，让边界更自然（但不至于“噪声满屏”）
+            detail = (n_high - 0.5) * 0.10
+            w_sand = max(0.0, w_sand + detail)
+            w_snow = max(0.0, w_snow - detail)
+
+            # 归一化：保证每个粒子的权重和为 1
+            # - 先归一化 sand/snow/mud
+            # - 再用 (1-w_blk) 给 block 让出比例
+            # - 最后整体再归一化一次，避免数值误差
+            s = w_sand + w_snow + w_mud
+            if s <= 1.0e-8:
+                w_sand, w_snow, w_mud = 1.0, 0.0, 0.0
+                s = 1.0
+            w_sand, w_snow, w_mud = w_sand / s, w_snow / s, w_mud / s
+
+            w_sand *= (1.0 - w_blk)
+            w_snow *= (1.0 - w_blk)
+            w_mud *= (1.0 - w_blk)
+
+            s2 = w_sand + w_snow + w_mud + w_blk
+            if s2 <= 1.0e-8:
+                w_sand, w_snow, w_mud, w_blk = 1.0, 0.0, 0.0, 0.0
+                s2 = 1.0
+            w_sand, w_snow, w_mud, w_blk = w_sand / s2, w_snow / s2, w_mud / s2, w_blk / s2
+
+            weights[pid, 0] = w_sand
+            weights[pid, 1] = w_snow
+            weights[pid, 2] = w_mud
+            weights[pid, 3] = w_blk
+
+            # 连续密度混合 + 低频压实度（更像“压实/湿区”）
+            # - rho_* 是“参考密度”（可理解为不同材料的目标密度）
+            # - compaction 用 low 噪声调一个轻微倍率，让大尺度区域“更紧/更松”
+            rho = (
+                w_sand * rho_sand
+                + w_snow * rho_snow
+                + w_mud * rho_mud
+                + w_blk * rho_block
+            )
+            compaction = 0.85 + 0.30 * n_low  # [0.85, 1.15]
+            rho *= compaction
+
+            # 写回 particle_mass（mass = density * volume）
+            # 说明：MPM 里粒子“质量”是核心输入；我们通过密度混合来实现“不同物性”的第一步。
+            r = float(builder.particle_radius[pid])
+            volume = (4.0 / 3.0) * np.pi * (r ** 3)
+            builder.particle_mass[pid] = float(rho * volume)
+
+            # 可选：基于高频噪声扰动初始位置（单位：voxel_size）
+            # 目的：粒子初始来自规则网格 + jitter，仍可能有可见条纹；再叠加一点“结构化噪声”更自然。
+            if pos_jitter > 0.0:
+                jx = _noise01(p, base_freq * high_mult, base_seed + 101) - 0.5
+                jy = _noise01(p, base_freq * high_mult, base_seed + 103) - 0.5
+                jz = _noise01(p, base_freq * high_mult, base_seed + 107) - 0.5
+                builder.particle_q[pid] = wp.vec3(
+                    float(p[0]) + voxel_size * pos_jitter * float(jx),
+                    float(p[1]) + voxel_size * pos_jitter * float(jy),
+                    float(p[2]) + voxel_size * pos_jitter * float(jz),
+                )
+
+        # 3) 为可视化提供“主导材料”集合（argmax 权重）
+        # 注意：这些集合只用于 debug/可视化；真正的材料行为由连续 weights 控制。
+        dominant = np.argmax(weights[all_ids], axis=1)
+        sand_ids = all_ids[dominant == 0]
+        snow_ids = all_ids[dominant == 1]
+        mud_ids = all_ids[dominant == 2]
+        block_ids = all_ids[dominant == 3]
+
+        return (
+            np.array(sand_ids, dtype=int),
+            np.array(snow_ids, dtype=int),
+            np.array(mud_ids, dtype=int),
+            np.array(block_ids, dtype=int),
+            weights,
+        )
+
+    # 兼容：旧版“按类别设置密度”的函数仍保留（目前不再使用）
     @staticmethod
     def _assign_density(builder, particle_ids, density):
-
         for pid in particle_ids:
             radius = builder.particle_radius[pid]
-            volume = (4.0/3.0) * np.pi * radius**3
+            volume = (4.0 / 3.0) * np.pi * radius**3
             mass = density * volume
             builder.particle_mass[pid] = mass
 
@@ -673,6 +841,37 @@ if __name__ == "__main__":
     parser.add_argument("--tolerance", "-tol", type=float, default=1.0e-6)     # 收敛容差
     parser.add_argument("--voxel-size", "-dx", type=float, default=0.05)        # 网格体素大小
 
+    # ========== 颗粒分区噪声参数（Perlin） ==========
+    # 这些参数控制 `emit_particles()` 里 low/mid/high 的噪声采样。
+    # 使用建议：
+    # - 想更“精细”：提高 `--noise-frequency` 或 `--noise-octaves`
+    # - 想换一个地形图样：改 `--noise-seed`
+    # 性能提示：octaves 会显著增加 Perlin 计算量（这里是按粒子循环采样）。
+
+    # frequency 越大，噪声变化越密（更精细）
+    parser.add_argument("--noise-frequency", type=float, default=0.0)
+    # octaves 越大，叠加细节越多（更精细，但更慢）
+    parser.add_argument("--noise-octaves", type=int, default=1)
+    # persistence 越大，高频细节权重越高（更“粗糙/颗粒感”）
+    parser.add_argument("--noise-persistence", type=float, default=0.5)
+    # lacunarity 越大，每层 octave 的频率增长越快（更快进入细节）
+    parser.add_argument("--noise-lacunarity", type=float, default=1.0)
+    # seed/base：改变噪声图样（不同随机地形）
+    parser.add_argument("--noise-seed", type=int, default=0)
+
+    # ========== 混杂地形：多尺度控制 ==========
+    # low/mid/high 采样频率分别是：
+    # - low = noise-frequency * noise-low-frequency-mult
+    # - mid = noise-frequency
+    # - high = noise-frequency * noise-high-frequency-mult
+    # 一般 low<1, high>1。
+    parser.add_argument("--noise-low-frequency-mult", type=float, default=0.2)
+    parser.add_argument("--noise-high-frequency-mult", type=float, default=4.0)
+    # 石块稀疏度：越大越少（建议 0.8~0.95）
+    parser.add_argument("--noise-block-threshold", type=float, default=0.85)
+    # 粒子初始位置噪声扰动（单位：voxel-size；0 关闭，建议 0.0~0.5）
+    parser.add_argument("--noise-position-jitter", type=float, default=0.0)
+
     # 解析参数并初始化查看器
     viewer, args = newton.examples.init(parser)
 
@@ -740,6 +939,21 @@ class TerrainGenerator:
         args.strain_basis = "P0"
         args.max_iterations = 50
         args.tolerance = 1.0e-6
+
+        # 噪声分区参数（与命令行保持一致的字段名）
+        # 说明：`emit_particles()` 通过 getattr(args, ...) 读取这些字段。
+        # TerrainGenerator 不是命令行入口，所以这里要补齐同名字段，保持行为一致。
+        args.noise_frequency = 1.2
+        args.noise_octaves = 4
+        args.noise_persistence = 0.5
+        args.noise_lacunarity = 2.0
+        args.noise_seed = 0
+
+        # 混杂地形：多尺度控制（含 block 稀疏阈值、位置扰动）
+        args.noise_low_frequency_mult = 0.2
+        args.noise_high_frequency_mult = 4.0
+        args.noise_block_threshold = 0.85
+        args.noise_position_jitter = 0.0
         
         return args
     
@@ -760,8 +974,10 @@ class TerrainGenerator:
         mpm_builder = newton.ModelBuilder()
         
         # 生成颗粒并分类
-        sand_particles, snow_particles, mud_particles, block_particles = \
-            Example.emit_particles(mpm_builder, self.args)
+        # 注意：这里返回的 *_particles 主要用于 debug/可视化；物性使用 particle_weights 做连续混合。
+        sand_particles, snow_particles, mud_particles, block_particles, particle_weights = Example.emit_particles(
+            mpm_builder, self.args
+        )
         
         # 最终化 MPM 模型
         mpm_model = mpm_builder.finalize()
@@ -784,27 +1000,35 @@ class TerrainGenerator:
         
         mpm_model_solver = SolverImplicitMPM.Model(mpm_model, mpm_options)
         
-        # 设置不同颗粒的材质参数
-        # 雪的属性
-        mpm_model_solver.material_parameters.yield_pressure[snow_particles].fill_(2.0e4)
-        mpm_model_solver.material_parameters.yield_stress[snow_particles].fill_(1.0e3)
-        mpm_model_solver.material_parameters.tensile_yield_ratio[snow_particles].fill_(0.05)
-        mpm_model_solver.material_parameters.friction[snow_particles].fill_(0.1)
-        mpm_model_solver.material_parameters.hardening[snow_particles].fill_(10.0)
-        
-        # 泥浆的属性
-        mpm_model_solver.material_parameters.yield_pressure[mud_particles].fill_(1.0e10)
-        mpm_model_solver.material_parameters.yield_stress[mud_particles].fill_(3.0e2)
-        mpm_model_solver.material_parameters.tensile_yield_ratio[mud_particles].fill_(1.0)
-        mpm_model_solver.material_parameters.hardening[mud_particles].fill_(2.0)
-        mpm_model_solver.material_parameters.friction[mud_particles].fill_(0.0)
-        
-        # 石块的属性
-        mpm_model_solver.material_parameters.yield_pressure[block_particles].fill_(1.0e8)
-        mpm_model_solver.material_parameters.yield_stress[block_particles].fill_(1.0e7)
-        mpm_model_solver.material_parameters.tensile_yield_ratio[block_particles].fill_(0.8)
-        mpm_model_solver.material_parameters.friction[block_particles].fill_(0.6)
-        mpm_model_solver.material_parameters.hardening[block_particles].fill_(20.0)
+        # 连续混合材料参数（同 Example；Warp wp.array 用 assign 写回）
+        # 说明：particle_weights 是 numpy (CPU) 计算结果，这里再写回到 Warp 的 material_parameters。
+        mp = mpm_model_solver.material_parameters
+        w = particle_weights.astype(np.float64, copy=False)
+        w_sand, w_snow, w_mud, w_blk = w[:, 0], w[:, 1], w[:, 2], w[:, 3]
+
+        def _blend_lin(a: float, b: float, c: float, d: float) -> np.ndarray:
+            return w_sand * a + w_snow * b + w_mud * c + w_blk * d
+
+        def _blend_log10(a: float, b: float, c: float, d: float) -> np.ndarray:
+            eps = 1.0e-30
+            la = float(np.log10(max(a, eps)))
+            lb = float(np.log10(max(b, eps)))
+            lc = float(np.log10(max(c, eps)))
+            ld = float(np.log10(max(d, eps)))
+            return np.power(10.0, _blend_lin(la, lb, lc, ld))
+
+        yield_pressure = _blend_log10(1.0e5, 2.0e4, 1.0e10, 1.0e8)
+        yield_stress = _blend_lin(0.0, 1.0e3, 3.0e2, 1.0e7)
+        tensile_yield_ratio = _blend_lin(0.0, 0.05, 1.0, 0.8)
+        hardening = _blend_lin(0.0, 10.0, 2.0, 20.0)
+        friction = np.clip(_blend_lin(0.48, 0.10, 0.00, 0.60), 0.0, 1.0)
+
+        wp_device = mpm_model.device
+        mp.yield_pressure.assign(wp.array(yield_pressure, dtype=float, device=wp_device))
+        mp.yield_stress.assign(wp.array(yield_stress, dtype=float, device=wp_device))
+        mp.tensile_yield_ratio.assign(wp.array(tensile_yield_ratio, dtype=float, device=wp_device))
+        mp.hardening.assign(wp.array(hardening, dtype=float, device=wp_device))
+        mp.friction.assign(wp.array(friction, dtype=float, device=wp_device))
         
         # 通知模型材质参数已更改
         mpm_model_solver.notify_particle_material_changed()
@@ -816,15 +1040,18 @@ class TerrainGenerator:
         # 创建求解器
         solver_mpm = SolverImplicitMPM(mpm_model_solver, mpm_options)
         
-        # 创建颗粒颜色数组（用于可视化）
-        particle_colors = wp.full(
-            mpm_model.particle_count, value=wp.vec3(0.7, 0.6, 0.4), 
-            dtype=wp.vec3, device=mpm_model.device
+        # 创建颗粒颜色数组（连续混合）
+        cols = np.array(
+            [
+                [0.7, 0.6, 0.4],   # sand
+                [0.75, 0.75, 0.8], # snow
+                [0.4, 0.25, 0.25], # mud
+                [0.5, 0.5, 0.5],   # block
+            ],
+            dtype=np.float32,
         )
-        particle_colors[sand_particles].fill_(wp.vec3(0.7, 0.6, 0.4))  # 沙子：棕黄色
-        particle_colors[snow_particles].fill_(wp.vec3(0.75, 0.75, 0.8))  # 雪：白色
-        particle_colors[mud_particles].fill_(wp.vec3(0.4, 0.25, 0.25))  # 泥：深棕色
-        particle_colors[block_particles].fill_(wp.vec3(0.5, 0.5, 0.5))  # 石块：灰色
+        colors_np = (particle_weights.astype(np.float32) @ cols).astype(np.float32)
+        particle_colors = wp.array(colors_np, dtype=wp.vec3, device=mpm_model.device)
         
         return mpm_model, solver_mpm, particle_colors
     
