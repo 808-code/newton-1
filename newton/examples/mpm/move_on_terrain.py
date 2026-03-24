@@ -1234,8 +1234,8 @@ if __name__ == "__main__":
     parser = newton.examples.create_parser()
     import argparse  # noqa: PLC0415
 
-    parser.add_argument("--emit-lo", type=float, nargs=3, default=[-0.5, -0.5, 0.0])
-    parser.add_argument("--emit-hi", type=float, nargs=3, default=[1.5, 0.5, 0.05])
+    parser.add_argument("--emit-lo", type=float, nargs=3, default=[-0.5, -0.8, 0.0])
+    parser.add_argument("--emit-hi", type=float, nargs=3, default=[1.5, 0.8, 0.05])
     parser.add_argument("--gravity", type=float, nargs=3, default=[0.0, 0.0, -10.0])
     parser.add_argument("--fps", type=float, default=60.0)
     parser.add_argument("--substeps", type=int, default=3)
