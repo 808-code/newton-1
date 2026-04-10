@@ -31,7 +31,7 @@ import newton.utils
 
 
 class Example:
-    def __init__(self, viewer, num_worlds=8, args=None):
+    def __init__(self, viewer, num_worlds=9, args=None):
         self.fps = 50
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
@@ -162,7 +162,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
-    parser.add_argument("--num-worlds", type=int, default=8, help="Total number of simulated worlds.")
+    parser.add_argument("--num-worlds", type=int, default=25, help="Total number of simulated worlds.")
 
     viewer, args = newton.examples.init(parser)
 
